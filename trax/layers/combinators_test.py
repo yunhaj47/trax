@@ -36,6 +36,16 @@ def ReturnConst(val):  # pylint: disable=invalid-name
   return tl.Fn('ReturnConst', lambda: val)
 
 
+def Duplicate():  # pylint: disable=invalid-name
+  """Duplicates the input."""
+  return tl.Fn('Duplicate', lambda x: (x, x), n_out=2)
+
+
+def SmallerThan(val):  # pylint: disable=invalid-name
+  """Checks if the input is smaller than certain value."""
+  return tl.Fn('SmallerThan', lambda x: x < val)
+
+
 # TODO(jonni): Consider a more generic home for this utiliity function.
 def as_list(outputs):
   """Converts layer outputs to a nested list, for easier equality testing.
@@ -581,6 +591,108 @@ class ScanTest(parameterized.TestCase):
       y = layer(x)
       self.assertEqual(as_list(y), [[2, 4, 8],
                                     [11, 31, 71]])
+
+
+class CondTest(absltest.TestCase):
+
+  def test_basic_true(self):
+    cond = ReturnConst(True)
+    true = ReturnConst([2])
+    false = ReturnConst([5])
+    layer = tl.Cond(cond, true, false)
+    layer.init(())
+    xs = tuple()
+    ys = layer(xs)
+    self.assertEqual(as_list(ys), 2)
+
+  def test_basic_false(self):
+    cond = ReturnConst(False)
+    true = ReturnConst([2])
+    false = ReturnConst([5])
+    layer = tl.Cond(cond, true, false)
+    layer.init(())
+    xs = tuple()
+    ys = layer(xs)
+    self.assertEqual(as_list(ys), 5)
+
+  def test_complex_blocks(self):
+    cond = ReturnConst(True)
+    true = DivideBy(2.)
+    false = DivideBy(4.)
+    layer = tl.Cond(cond, true, false)
+    xs = [np.arange(5).astype(np.float32)]
+    layer.init(shapes.signature(xs))
+    ys = layer(xs)
+    self.assertEqual(as_list(ys), [0., 0.5, 1.0, 1.5, 2.0])
+
+  def test_condition_func_true(self):
+    cond = SmallerThan(3.0)
+    true = DivideBy(2.)
+    false = DivideBy(4.)
+    layer = tl.Cond(cond, true, false)
+    xs = (np.array(2.), np.array([4., 12.]))
+    layer.init(shapes.signature(xs))
+    ys = layer(xs)
+    self.assertEqual(as_list(ys), [2., 6.])
+
+  def test_condition_func_false(self):
+    cond = SmallerThan(3.0)
+    true = DivideBy(2.)
+    false = DivideBy(4.)
+    layer = tl.Cond(cond, true, false)
+    xs = (np.array(4.), np.array([4., 12.]))
+    layer.init(shapes.signature(xs))
+    ys = layer(xs)
+    self.assertEqual(as_list(ys), [1., 3.])
+
+  def test_exception_n_out(self):
+    cond = SmallerThan(3.0)
+    true = DivideBy(2.)
+    false = Duplicate()
+    self.assertRaises(ValueError, lambda: tl.Cond(cond, true, false))
+
+  def test_exception_n_in(self):
+    cond = SmallerThan(3.0)
+    true = ReturnConst(2.)
+    false = DivideBy(2.)
+    self.assertRaises(ValueError, lambda: tl.Cond(cond, true, false))
+
+  def test_exception_run1(self):
+    # We expect exactly one input.
+    cond = SmallerThan(3.0)
+    true = ReturnConst(2.)
+    false = ReturnConst(5.)
+    def init_and_run(layer, xs):
+      layer.init(shapes.signature(xs))
+      layer(xs)
+    # It will pass with one input.
+    xs = np.array(4.)
+    layer = tl.Cond(cond, true, false)
+    init_and_run(layer, xs)
+    # It will fail with zero or two inputs.
+    for xs in ((), (np.array(4.), np.array([4., 12.]))):
+      layer = tl.Cond(cond, true, false)
+      # pylint: disable=cell-var-from-loop
+      self.assertRaises(Exception, lambda: init_and_run(layer, xs))
+
+  def test_exception_run2(self):
+    # We expect exactly two inputs.
+    cond = SmallerThan(3.0)
+    true = DivideBy(2.)
+    false = DivideBy(5.)
+    def init_and_run(layer, xs):
+      layer.init(shapes.signature(xs))
+      layer(xs)
+    # It will pass with two inputs.
+    xs = (np.array(4.), np.array([4., 12.]))
+    layer = tl.Cond(cond, true, false)
+    init_and_run(layer, xs)
+    # It will fail with zero or one input.
+    for xs in ((), (np.array(4.))):
+      # pylint: disable=cell-var-from-loop
+      self.assertRaises(Exception, lambda: init_and_run(layer, xs))
+
+  # TODO(jaszczur): add a test including weights in sublayers, possibly?
 
 
 class BatchLeadingAxesTest(absltest.TestCase):

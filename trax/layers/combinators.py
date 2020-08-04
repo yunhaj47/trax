@@ -431,6 +431,146 @@ class Scan(base.Layer):
       self.weights = (weights,)
 
 
+class Cond(base.Layer):
+  """Applies layers conditionally.
+
+  For parameters `cond`, `true`, and `false` runs the equivalent of `true(y)
+  if cond(x) else false(y)`, where `x` is `cond.n_in` elements from front of the
+  stack and `y` is the rest of the stack.
+  Exactly one of `true` and `false` functions is executed, so it can be used to
+  conditionally run long computations. The state of non-executed function is not
+  updated.
+
+  `cond` must return exactly one element: a Boolean scalar.
+  `true` and `false` must have the same n_in, and the same n_out.
+  """
+
+  def __init__(self, cond, true, false, name=None):
+    super(Cond, self).__init__(name=name)
+
+    sublayers = [cond, true, false]
+    self._sublayers = sublayers
+    self._n_layers = len(sublayers)
+    self._cond = cond
+    self._true = true
+    self._false = false
+
+    if cond.n_out != 1 or true.n_in != false.n_in or true.n_out != false.n_out:
+      raise ValueError(("shapes don't agree: cond:{}->{} ; true:{}->{} ;"
+                        " false:{}->{}").format(cond.n_in, cond.n_out,
+                                                true.n_in, true.n_out,
+                                                false.n_in, false.n_out))
+
+    self._n_in = cond.n_in + true.n_in
+    self._n_out = true.n_out
+    self._weights = tuple(None for l in sublayers)
+    self._state = tuple(None for l in sublayers)
+
+  # pylint: disable=protected-access
+  def init_weights_and_state(self, input_signature):
+    weights = []
+    states = []
+    # In the code below, stack, inputs, and outputs are abstract (shapes and
+    # dtypes), but weights and states are non-abstract actual values.
+    stack = _make_tuple(input_signature)
+
+    # Inputs/outputs of `cond`.
+    inputs = _inputs_from_stack(self._cond, stack)
+    weights_or_cache_marker, state_or_cache_marker = (
+        self._cond.init(inputs, use_cache=True))
+    weights.append(weights_or_cache_marker)
+    states.append(state_or_cache_marker)
+    self._cond._forward_abstract(inputs)
+    stack = _make_tuple(_outputs_onto_stack(self._cond, [], stack))
+
+    # Inputs/outputs of `true` and `false`.
+    for sublayer in [self._true, self._false]:
+      inputs = _inputs_from_stack(sublayer, stack)
+      weights_or_cache_marker, state_or_cache_marker = (
+          sublayer.init(inputs, use_cache=True))
+      weights.append(weights_or_cache_marker)
+      states.append(state_or_cache_marker)
+
+    self.state = states
+    self.weights = weights
+    # pylint: enable=protected-access
+
+  @property
+  def state(self):
+    """Returns a tuple containing this layer's state; may be empty."""
+    return self._state
+
+  @state.setter
+  def state(self, state):
+    """Recursively sets non-param state on this layer and all sublayers."""
+    self._state = state
+    if len(state) != 3:
+      raise ValueError(
+          f'Number of state elements ({len(state)}) does not equal '
+          f'number of sublayers (3).')
+    for layer, layer_state in zip(self.sublayers, state):
+      layer.state = layer_state
+
+  def _validate_forward_inputs(self, xs):
+    xs = _make_tuple(xs)
+    if len(xs) < self.n_in:
+      raise ValueError(
+          f'Number of inputs ({len(xs)}) to Cond.forward less than n_in '
+          f'({self.n_in}).')
+
+  def forward(self, xs):
+    # TODO(jaszczur): modify; it's a copy from SkippingSerial
+    self._validate_forward_inputs(xs)
+    layers_state = self.state
+    # Get N+1 rngs, N for running layers and one extra.
+    rngs = _split_rngs(self.rng, 3)
+
+    # Prepare the stack and do some safety checks as in the parent class.
+    stack = _make_tuple(xs)
+    new_state = []
+    weights = self.weights
+    if len(weights) != 3:
+      raise ValueError('number of weights ({}) not equal to number of layers '
+                       '({})'.format(len(weights), 3))
+    if len(layers_state) != 3:
+      raise ValueError('length of state ({}) not equal to number of layers '
+                       '({})'.format(len(layers_state), 3))
+
+    rng0 = (fastmath.psum(rngs[0], 'batch') if fastmath.device_count() > 1
+            else rngs[0])
+
+    def true_func(t):
+      outputs, state = self._true.pure_fn(t[0][0], t[1][0], t[2][0], t[3][0])
+      return outputs, (state, t[2][1])
+    def false_func(t):
+      outputs, state = self._false.pure_fn(t[0][1], t[1][1], t[2][1], t[3][1])
+      return outputs, (t[2][0], state)
+
+    cond_inputs = _inputs_from_stack(self._cond, xs)
+    cond_output, s = self._cond.pure_fn(cond_inputs, self.weights[0],
+                                        self.state[0], rng0, use_cache=True)
+    stack = _outputs_onto_stack(self._cond, [], stack)
+    new_state.append(s)
+
+    outputs, both_states = fastmath.cond(
+        cond_output,
+        true_func,
+        false_func,
+        [(stack, stack),
+         # TODO(jaszczur): Can the below be just "self.weights"? I think so.
+         (self.weights[1], self.weights[2]),
+         (self.state[1], self.state[2]),
+         (rngs[1], rngs[2])]
+    )
+    stack = _outputs_onto_stack(self._cond, [], stack)
+    stack = _outputs_onto_stack(self._true, outputs, stack)
+    new_state.extend(both_states)
+    # TODO(jaszczur): state is COMPLETELY messed up at this point. It has two
+    # elements instead of three.
+    self.state = new_state
+    return _make_singleitem_or_original(stack)
+
+
 # pylint: disable=invalid-name
 def Branch(*layers, name='Branch'):
   """Combinator that applies a list of layers in parallel to copies of inputs.
